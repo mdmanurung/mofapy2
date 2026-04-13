@@ -276,24 +276,48 @@ class ConsensusMOFA:
         self,
         density_threshold: float = 0.5,
         local_neighborhood_size: float = 0.30,
+        clustering: str = "kmeans",
+        metric: str = "euclidean",
         linkage: str = "average",
-        metric: str = "cosine",
+        random_state: int = 1,
     ) -> "ConsensusMOFA":
         """Cluster pooled components into K consensus groups.
 
-        Uses hierarchical clustering with the given ``linkage`` on a
-        precomputed ``metric`` distance matrix. Components whose mean
-        distance to their local neighborhood exceeds
-        ``density_threshold`` are filtered out as outliers.
+        Default settings match cNMF: components are already L2-normalized
+        in :meth:`combine`, pairwise **Euclidean** distances are computed,
+        components whose mean distance to their ``int(local_neighborhood_size
+        * n_iter)`` nearest (non-self) neighbors exceeds
+        ``density_threshold`` are filtered out, and the survivors are
+        clustered with **KMeans** into ``self.K`` groups.
+
+        Parameters
+        ----------
+        density_threshold:
+            Local-density cutoff. Components with mean k-NN distance
+            strictly less than this value are kept.
+        local_neighborhood_size:
+            Fraction of ``n_iter`` used as the neighborhood size; matches
+            cNMF's ``local_neighborhood_size`` parameter.
+        clustering:
+            ``"kmeans"`` (default, matches cNMF) or ``"agglomerative"``.
+        metric:
+            Pairwise distance metric — ``"euclidean"`` (default, matches
+            cNMF) or any other metric accepted by
+            :func:`sklearn.metrics.pairwise_distances`.
+        linkage:
+            Linkage method, only used when ``clustering="agglomerative"``.
+        random_state:
+            Seed passed to KMeans for reproducibility (cNMF uses ``1``).
         """
         if self.components is None:
             raise RuntimeError("Call combine() before cluster().")
-        from sklearn.cluster import AgglomerativeClustering
+        from sklearn.cluster import AgglomerativeClustering, KMeans
         from sklearn.metrics import pairwise_distances
 
         D = pairwise_distances(self.components, metric=metric)
         n_runs = len(self.runs)
-        k_nn = max(1, int(round(local_neighborhood_size * n_runs)))
+        # Match cNMF: int(local_neighborhood_size * n_iter), truncation.
+        k_nn = max(1, int(local_neighborhood_size * n_runs))
         # Exclude self-distance at index 0.
         nearest = np.sort(D, axis=1)[:, 1 : k_nn + 1]
         local_density = nearest.mean(axis=1)
@@ -307,13 +331,28 @@ class ConsensusMOFA:
                 "plot_local_density()."
             )
 
-        D_keep = D[np.ix_(keep, keep)]
-        hc = AgglomerativeClustering(
-            n_clusters=self.K,
-            metric="precomputed",
-            linkage=linkage,
-        )
-        labels = hc.fit_predict(D_keep)
+        filtered = self.components[keep]
+        if clustering == "kmeans":
+            # cNMF uses KMeans(n_clusters=K, n_init=10, random_state=1).
+            km = KMeans(
+                n_clusters=self.K,
+                n_init=10,
+                random_state=random_state,
+            )
+            labels = km.fit_predict(filtered)
+        elif clustering == "agglomerative":
+            D_keep = D[np.ix_(keep, keep)]
+            hc = AgglomerativeClustering(
+                n_clusters=self.K,
+                metric="precomputed",
+                linkage=linkage,
+            )
+            labels = hc.fit_predict(D_keep)
+        else:
+            raise ValueError(
+                f"clustering must be 'kmeans' or 'agglomerative', got "
+                f"{clustering!r}."
+            )
 
         self.distance_matrix = D
         self.local_density = local_density
@@ -359,11 +398,17 @@ class ConsensusMOFA:
                 )
                 W_out[m][:, c] = np.median(W_stack, axis=0)
 
-            # Per-cluster stability = 1 - mean pairwise cosine distance.
+            # Per-cluster stability in [0, 1]. Components are L2-normalized
+            # in combine(), so Euclidean distance is bounded by sqrt(2) and
+            # equals sqrt(2 * (1 - cos_sim)); map back to cosine similarity:
+            #   stability = 1 - mean_pairwise_dist^2 / 2
+            # This reduces to (1 - mean_cosine_distance) and so is directly
+            # comparable across metric="euclidean"/"cosine".
             if self.distance_matrix is not None and n_used[c] > 1:
                 sub = self.distance_matrix[np.ix_(member_idx, member_idx)]
                 iu = np.triu_indices(n_used[c], k=1)
-                stability[c] = 1.0 - float(sub[iu].mean())
+                mean_d = float(sub[iu].mean())
+                stability[c] = max(0.0, 1.0 - 0.5 * mean_d * mean_d)
             else:
                 stability[c] = 1.0
 
@@ -386,6 +431,92 @@ class ConsensusMOFA:
             "order": order,
         }
         return self.consensus_result
+
+    # ------------------------------------------------------------------ #
+    # Step 5 — refit Z from consensus W (cNMF-style usage refit)         #
+    # ------------------------------------------------------------------ #
+    def refit(self, data=None) -> Dict:
+        """Re-estimate factors ``Z`` given the consensus loadings ``W``.
+
+        This is the MOFA analogue of cNMF's ``refit_usage``: with the
+        consensus spectra (here, consensus per-view ``W``) held fixed,
+        the sample-factor scores are re-solved by ordinary least squares
+        against the observed data. For Gaussian likelihoods this has a
+        closed form stacked across views:
+
+            Y_concat = Z @ W_concat.T
+            Z = Y_concat @ W_concat @ (W_concat.T @ W_concat)^{-1}
+
+        where ``Y_concat`` is the horizontal concatenation of all views
+        (first group only — multi-group refit is not supported in v1)
+        and ``W_concat`` stacks the consensus loadings feature-wise.
+        NaNs in ``Y`` are handled by row-wise masked least squares.
+
+        Parameters
+        ----------
+        data:
+            Optional override for the data used in the refit. If
+            ``None``, the data passed to the constructor is used.
+
+        Returns
+        -------
+        dict with keys ``Z_refit`` (N × K). The consensus ``W`` is
+        unchanged. :attr:`consensus_result` is updated in place with
+        the new ``Z``.
+        """
+        if self.consensus_result is None:
+            raise RuntimeError("Call consensus() before refit().")
+        src = self.data if data is None else data
+
+        # Normalize data to nested list layout, take group 0.
+        if isinstance(src, np.ndarray):
+            views = [src]
+        elif isinstance(src, list):
+            views = [v[0] if isinstance(v, list) else v for v in src]
+        else:
+            raise TypeError(
+                "refit() expects a nested list data[m][g] or numpy array."
+            )
+
+        W_cons = self.consensus_result["W"]
+        if len(views) != len(W_cons):
+            raise ValueError(
+                f"refit data has {len(views)} views but consensus has "
+                f"{len(W_cons)}."
+            )
+
+        # MOFA centers each feature during training (default
+        # data_opts['center_groups']=True). Center the refit data the
+        # same way so that W — learned on centered data — is consistent.
+        centered = []
+        for v in views:
+            v = np.asarray(v, dtype=float)
+            mu = np.nanmean(v, axis=0, keepdims=True)
+            centered.append(v - mu)
+        Y = np.concatenate(centered, axis=1)
+        W_concat = np.concatenate(W_cons, axis=0)
+        N, F = Y.shape
+        K = W_concat.shape[1]
+
+        Z_refit = np.zeros((N, K))
+        any_nan = np.isnan(Y).any()
+        if not any_nan:
+            # Closed-form least squares.
+            gram = W_concat.T @ W_concat
+            Z_refit = Y @ W_concat @ np.linalg.pinv(gram)
+        else:
+            # Row-wise masked least squares for missing features.
+            for n in range(N):
+                mask = ~np.isnan(Y[n])
+                if not mask.any():
+                    continue
+                Wn = W_concat[mask]
+                yn = Y[n, mask]
+                Z_refit[n], *_ = np.linalg.lstsq(Wn, yn, rcond=None)
+
+        self.consensus_result["Z"] = Z_refit
+        self.consensus_result["Z_refit"] = Z_refit
+        return {"Z_refit": Z_refit}
 
     # ------------------------------------------------------------------ #
     # K selection diagnostic                                             #

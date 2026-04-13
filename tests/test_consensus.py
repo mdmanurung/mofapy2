@@ -119,6 +119,49 @@ def test_save_roundtrip(toy_data, tmp_path):
         assert len(f["runs"]) == 3
 
 
+def test_cluster_defaults_match_cnmf(toy_data):
+    """Default clustering is KMeans on Euclidean distances (cNMF parity)."""
+    cm = _fit(toy_data, K=3, n_iter=3, seeds=[0, 1, 2])
+    cm.combine(source="W")
+    cm.cluster(density_threshold=np.inf)
+    # Every pooled component must have been assigned to exactly one of K
+    # clusters; with density_threshold=inf none are filtered.
+    assert cm.kept_index.shape[0] == 9
+    assert cm.labels.shape == (9,)
+    assert set(cm.labels).issubset(set(range(3)))
+    # Distance matrix diagonal must be ~0 (Euclidean self-distance).
+    np.testing.assert_allclose(np.diag(cm.distance_matrix), 0.0, atol=1e-8)
+
+
+def test_cluster_agglomerative_fallback(toy_data):
+    cm = _fit(toy_data, K=3, n_iter=3, seeds=[0, 1, 2])
+    cm.combine(source="W")
+    cm.cluster(density_threshold=np.inf, clustering="agglomerative")
+    out = cm.consensus()
+    assert out["Z"].shape == (40, 3)
+
+
+def test_refit_z_matches_least_squares(toy_data):
+    cm = _fit(toy_data, K=3, n_iter=3, seeds=[0, 1, 2])
+    cm.combine(source="W")
+    cm.cluster(density_threshold=np.inf)
+    out = cm.consensus()
+    Z_before = out["Z"].copy()
+
+    cm.refit()
+    Z_after = cm.consensus_result["Z"]
+    assert Z_after.shape == Z_before.shape
+
+    # Verify closed-form: Z_refit = Y_c @ W @ pinv(W.T W), where Y_c is
+    # the feature-centered horizontal concatenation of the views.
+    views = [v[0] for v in toy_data]
+    centered = [v - v.mean(axis=0, keepdims=True) for v in views]
+    Y = np.concatenate(centered, axis=1)
+    W_concat = np.concatenate(cm.consensus_result["W"], axis=0)
+    expected = Y @ W_concat @ np.linalg.pinv(W_concat.T @ W_concat)
+    np.testing.assert_allclose(Z_after, expected, atol=1e-8)
+
+
 def test_k_selection_sweep(toy_data):
     cm = ConsensusMOFA(
         data=toy_data,
